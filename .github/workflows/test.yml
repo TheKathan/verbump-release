@@ -1,0 +1,97 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    # the action against a throwaway polyglot repo, without pushing
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
+
+      - name: Build a fixture repo (Python api, Node web, Go billing)
+        run: |
+          set -euo pipefail
+          mkdir fixture && cd fixture
+          git init -q -b main
+          git config user.email ci@example.com
+          git config user.name ci
+          mkdir -p services/api apps/web services/billing
+          printf '[project]\nname = "api"\nversion = "1.4.0"\n' > services/api/pyproject.toml
+          printf '{\n  "name": "web",\n  "version": "0.3.0"\n}\n' > apps/web/package.json
+          printf 'package main\n' > services/billing/main.go
+          cat > verbump.toml <<'TOML'
+          [packages.api]
+          path = "services/api"
+          files = ["pyproject.toml"]
+
+          [packages.web]
+          path = "apps/web"
+          files = ["package.json"]
+
+          [packages.billing]
+          path = "services/billing"
+          tag_format = "{path}/v{version}"
+          TOML
+          git add -A && git commit -qm "feat: initial"
+          git tag api/v1.4.0 && git tag web/v0.3.0 && git tag services/billing/v0.9.0
+          echo "console.log(1)" > apps/web/index.js
+          echo "// x" >> services/billing/main.go
+          git add -A && git commit -qm "feat: web page and billing tweak"
+
+      - name: Dry run with an explicit bump
+        id: explicit
+        uses: ./
+        with:
+          working-directory: fixture
+          bump: minor
+          source-branch: feature/web-page
+          push: "false"
+
+      - name: Check the explicit run
+        env:
+          TAGS: ${{ steps.explicit.outputs.tags }}
+          RELEASED: ${{ steps.explicit.outputs.released }}
+        run: |
+          set -euo pipefail
+          test "$RELEASED" = true
+          test "$TAGS" = '["services/billing/v0.10.0","web/v0.4.0"]' || test "$TAGS" = '["web/v0.4.0","services/billing/v0.10.0"]'
+          grep -q '"version": "0.4.0"' fixture/apps/web/package.json
+          grep -q 'version = "1.4.0"' fixture/services/api/pyproject.toml
+          grep -q '## \[0.4.0\]' fixture/apps/web/CHANGELOG.md
+          git -C fixture checkout -q -- . && git -C fixture clean -qfd
+
+      - name: Dry run from a release branch and trunk-semver-style versions
+        id: exact
+        uses: ./
+        with:
+          working-directory: fixture
+          previous-version: v0.0.0
+          version: v0.0.1
+          source-branch: release/api/2.0.0
+          push: "false"
+
+      - name: Check the release-branch run
+        env:
+          PLAN: ${{ steps.exact.outputs.plan }}
+        run: |
+          set -euo pipefail
+          jq -r '.releases[] | "\(.name) \(.version) \(.reason)"' "$PLAN" | sort > got.txt
+          printf 'api 2.0.0 exact\nbilling 0.9.1 patch\nweb 0.3.1 patch\n' > want.txt
+          diff want.txt got.txt

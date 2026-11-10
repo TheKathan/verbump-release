@@ -1,0 +1,189 @@
+name: verbump release
+description: Release the packages a merge changed - bump their versions and changelogs, commit, tag, push and publish a GitHub release per package.
+author: "TheKathan"
+
+branding:
+  icon: "tag"
+  color: "blue"
+
+# Run after actions/checkout with fetch-depth: 0, in a job with contents: write (and
+# pull-requests: read for the PR lookup). verbump comes from TheKathan/setup-verbump, which
+# leaves the job's own Python alone.
+
+inputs:
+  bump:
+    description: "major, minor or patch for every changed package."
+    required: false
+    default: ""
+  previous-version:
+    description: "With `version`: the bump is the step between them, e.g. trunk-semver's previous-version and version outputs."
+    required: false
+    default: ""
+  version:
+    description: "With `previous-version`: the new version whose step from it gives the bump."
+    required: false
+    default: ""
+  source-branch:
+    description: "Branch of the merged PR. Empty: looked up from the pushed commit. With no bump inputs, feature/* and feat/* give minor, the rest patch; release/<package>/X.Y.Z gives an exact version."
+    required: false
+    default: ""
+  verbump-version:
+    description: 'verbump to install with setup-verbump: "1" (latest 1.x), an exact version such as "1.0.1", or a pip requirement.'
+    required: false
+    default: "1"
+  install:
+    description: 'Install verbump. "false" uses the verbump already on the PATH, e.g. from an earlier setup-verbump step.'
+    required: false
+    default: "true"
+  config:
+    description: "Path to verbump.toml, relative to working-directory."
+    required: false
+    default: "verbump.toml"
+  working-directory:
+    description: "Repo root."
+    required: false
+    default: "."
+  push:
+    description: "Commit, tag and push. \"false\" writes the files and the plan only."
+    required: false
+    default: "true"
+  github-release:
+    description: "Publish a GitHub release per package (needs push)."
+    required: false
+    default: "true"
+  push-branch:
+    description: "Branch the release commit is pushed to."
+    required: false
+    default: ${{ github.ref_name }}
+  github-token:
+    description: "Token for the PR lookup and the GitHub releases."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  released:
+    description: "true when at least one package was released (with push: false, would have been)."
+    value: ${{ steps.apply.outputs.count != '0' }}
+  tags:
+    description: "JSON array of the tags of this release."
+    value: ${{ steps.apply.outputs.tags }}
+  plan:
+    description: "Path to the plan JSON: bump, commit_message and releases (name, path, previous, version, tag, ...)."
+    value: ${{ steps.apply.outputs.plan }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: TheKathan/setup-verbump@v1
+      if: inputs.install == 'true'
+      with:
+        version: ${{ inputs.verbump-version }}
+
+    - name: Find verbump
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v verbump >/dev/null || { echo "::error::verbump is not on the PATH; leave install on or run TheKathan/setup-verbump first"; exit 1; }
+        echo "VERBUMP=$(command -v verbump)" >> "$GITHUB_ENV"
+        verbump --version
+
+    - name: Source branch of the merged PR
+      id: source
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GIVEN: ${{ inputs.source-branch }}
+      run: |
+        set -euo pipefail
+        src="$GIVEN"
+        if [[ -z "$src" ]]; then
+          src=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].head.ref // ""' 2>/dev/null || true)
+        fi
+        echo "branch=$src" >> "$GITHUB_OUTPUT"
+        echo "PR source branch: ${src:-(none)}"
+
+    - name: Write versions and changelogs
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BUMP: ${{ inputs.bump }}
+        PREVIOUS: ${{ inputs.previous-version }}
+        NEXT: ${{ inputs.version }}
+        SOURCE: ${{ steps.source.outputs.branch }}
+        CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        plan="$RUNNER_TEMP/verbump-plan.json"
+        if [[ -n "$BUMP" ]]; then
+          bump=(--bump "$BUMP")
+        elif [[ -n "$PREVIOUS" && -n "$NEXT" ]]; then
+          bump=(--previous "$PREVIOUS" --version-from "$NEXT")
+        else
+          bump=(--branch "$SOURCE")
+        fi
+        "$VERBUMP" -c "$CONFIG" apply "${bump[@]}" --release-branch "$SOURCE" --plan-out "$plan"
+        "$VERBUMP" -c "$CONFIG" check
+        {
+          echo "plan=$plan"
+          echo "count=$(jq '.releases | length' "$plan")"
+          echo "tags=$(jq -c '[.releases[].tag]' "$plan")"
+        } >> "$GITHUB_OUTPUT"
+        {
+          echo "## verbump"
+          echo
+          echo "Bump: **$(jq -r .bump "$plan")**, source branch \`${SOURCE:-none}\`"
+          echo
+          if [[ "$(jq '.releases | length' "$plan")" == "0" ]]; then
+            echo "Nothing to release: no package changed since its last tag."
+          else
+            echo "| Package | Previous | Version | Tag | Why |"
+            echo "|---|---|---|---|---|"
+            jq -r '.releases[] | "| \(.name) | \(.previous // "-") | \(.version) | `\(.tag)` | \(.reason) |"' "$plan"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Commit, tag and push
+      if: inputs.push == 'true' && steps.apply.outputs.count != '0'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PLAN: ${{ steps.apply.outputs.plan }}
+        BRANCH: ${{ inputs.push-branch }}
+      run: |
+        set -euo pipefail
+        for tag in $(jq -r '.releases[].tag' "$PLAN"); do
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]]; then
+            echo "::error::tag $tag already exists on the remote; exact version tags are never moved"; exit 1
+          fi
+        done
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -A
+        if git diff --cached --quiet; then
+          echo "files already at the planned versions"
+        else
+          git commit -m "$(jq -r .commit_message "$PLAN")"
+          git push origin "HEAD:$BRANCH"
+        fi
+        "$VERBUMP" tag --plan "$PLAN"
+        for tag in $(jq -r '.releases[].tag' "$PLAN"); do git push origin "refs/tags/$tag"; done
+        for tag in $(jq -r '.releases[].major_tag // empty' "$PLAN"); do git push --force origin "refs/tags/$tag"; done
+
+    - name: Publish the GitHub releases
+      if: inputs.push == 'true' && inputs.github-release == 'true' && steps.apply.outputs.count != '0'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PLAN: ${{ steps.apply.outputs.plan }}
+        CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        jq -r '.releases[] | "\(.name)\t\(.version)\t\(.tag)"' "$PLAN" | while IFS=$'\t' read -r name version tag; do
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists"; continue
+          fi
+          "$VERBUMP" -c "$CONFIG" notes "$name" "$version" > "$RUNNER_TEMP/verbump-notes.md"
+          gh release create "$tag" --title "$name $version" --notes-file "$RUNNER_TEMP/verbump-notes.md" --verify-tag
+        done
