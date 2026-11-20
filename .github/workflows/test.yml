@@ -9,7 +9,7 @@ permissions:
 jobs:
   test:
     # the action against a throwaway polyglot repo, without pushing
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && 'coop-verbump-release' || matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -17,6 +17,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install the GitHub CLI
+        if: runner.os == 'Linux'
+        env:
+          GH_CLI_VERSION: 2.103.3
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null; then gh --version | head -1; exit 0; fi
+          d="$RUNNER_TEMP/gh-cli" && mkdir -p "$d" && cd "$d"
+          base="https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}"
+          tarball="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "$base/$tarball"
+          curl -fsSL "$base/gh_${GH_CLI_VERSION}_checksums.txt" | grep " ${tarball}\$" | sha256sum -c -
+          tar -xzf "$tarball"
+          echo "$d/gh_${GH_CLI_VERSION}_linux_amd64/bin" >> "$GITHUB_PATH"
 
       - name: actionlint
         if: runner.os == 'Linux'
