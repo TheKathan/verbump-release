@@ -3,7 +3,6 @@ name: release
 on:
   push:
     branches: [main]
-    # CI-only commits (workflows, dependabot, actionlint config) release nothing
     paths-ignore: ['.github/**']
 
 concurrency:
